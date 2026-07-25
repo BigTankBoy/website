@@ -232,7 +232,7 @@ jobs:
       - name: Verify host-side overwrite before runner post phase
         run: |
           set -euo pipefail
-          target="$RUNNER_WORKSPACE/_actions/actions/checkout/v5/dist/index.js"
+          target="$(dirname "$RUNNER_WORKSPACE")/_actions/actions/checkout/v5/dist/index.js"
           test -f "$target"
           grep -q "POST_ACTION_NATURAL_EXECUTION" "$target"
           echo "HOST_SIDE_OUTSIDE_WORKSPACE_OVERWRITE=true"
