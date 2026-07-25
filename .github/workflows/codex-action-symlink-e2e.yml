@@ -225,7 +225,7 @@ jobs:
           output-file: codex-output.md
           permission-profile: ":workspace"
           safety-strategy: drop-sudo
-          allow-users: "*"
+          allow-users: "JunhoKang"
           codex-version: 0.144.6
           model: gpt-4.1
           effort: low
