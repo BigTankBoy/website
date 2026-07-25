@@ -17,7 +17,7 @@ jobs:
   reproduce:
     if: >-
       github.repository == 'BigTankBoy/websiteeeee' &&
-      github.actor == 'abc9874000-art' &&
+      github.actor == 'BigTankBoy' &&
       startsWith(github.event.pull_request.head.ref, 'codex-symlink-e2e-')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -225,7 +225,7 @@ jobs:
           output-file: codex-output.md
           permission-profile: ":workspace"
           safety-strategy: drop-sudo
-          allow-users: "abc9874000-art"
+          allow-users: "BigTankBoy"
           codex-version: 0.144.6
           model: gpt-4.1
           effort: low
