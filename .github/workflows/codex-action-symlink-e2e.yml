@@ -48,6 +48,7 @@ jobs:
       - name: Start Responses API to GitHub Models bridge
         env:
           BRIDGE_PORT: "18080"
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cat >"$RUNNER_TEMP/responses-bridge.mjs" <<'NODE'
@@ -104,13 +105,16 @@ jobs:
               if (!authorization?.startsWith("Bearer ")) {
                 return sendJson(res, 401, { error: "missing bearer token" });
               }
+              if (!process.env.GITHUB_TOKEN) {
+                return sendJson(res, 500, { error: "missing GitHub token" });
+              }
 
               const modelResponse = await fetch(
                 "https://models.github.ai/inference/chat/completions",
                 {
                   method: "POST",
                   headers: {
-                    authorization,
+                    authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
                     "content-type": "application/json",
                     accept: "application/vnd.github+json",
                     "x-github-api-version": "2026-03-10",
@@ -212,7 +216,7 @@ jobs:
       - name: Run vulnerable Codex Action
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56
         with:
-          openai-api-key: ${{ github.token }}
+          openai-api-key: codex-e2e-test-key
           responses-api-endpoint: http://127.0.0.1:18080/v1/responses
           prompt: >-
             Inspect the checkout and provide exactly the final response required
